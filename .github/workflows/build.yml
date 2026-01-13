@@ -1,0 +1,256 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS builds
+          - os: darwin
+            arch: amd64
+            runner: macos-latest
+            output: qslicerpicker-darwin-amd64
+            asset: qslicerpicker-macos-amd64
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+            output: qslicerpicker-darwin-arm64
+            asset: qslicerpicker-macos-arm64
+          # Linux builds
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+            output: qslicerpicker-linux-amd64
+            asset: qslicerpicker-linux-amd64
+          # Windows builds
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+            output: qslicerpicker-windows-amd64.exe
+            asset: qslicerpicker-windows-amd64.exe
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-${{ matrix.arch }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.arch }}-go-
+          ${{ runner.os }}-go-
+
+    - name: Install dependencies (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1-mesa-dev xorg-dev
+
+    - name: Install Fyne CLI (macOS)
+      if: matrix.os == 'darwin'
+      run: |
+        go install fyne.io/tools/cmd/fyne@latest
+
+    - name: Build (macOS)
+      if: matrix.os == 'darwin'
+      shell: bash
+      env:
+        GOOS: darwin
+        GOARCH: ${{ matrix.arch }}
+        CGO_ENABLED: 1
+      run: |
+        go mod tidy
+        # Build binary first
+        go build -v -o "QSlicerPicker" .
+        
+        # Create .app bundle structure
+        APP_NAME="QSlicerPicker-${{ matrix.arch }}"
+        APP_DIR="${APP_NAME}.app"
+        mkdir -p "${APP_DIR}/Contents/MacOS"
+        mkdir -p "${APP_DIR}/Contents/Resources"
+        
+        # Move binary
+        mv "QSlicerPicker" "${APP_DIR}/Contents/MacOS/QSlicerPicker"
+        chmod +x "${APP_DIR}/Contents/MacOS/QSlicerPicker"
+        
+        # Copy icon if exists
+        if [ -f "q.png" ]; then
+          cp "q.png" "${APP_DIR}/Contents/Resources/icon.png"
+        fi
+        
+        # Create Info.plist
+        cat > "${APP_DIR}/Contents/Info.plist" << EOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>CFBundleExecutable</key>
+          <string>QSlicerPicker</string>
+          <key>CFBundleIdentifier</key>
+          <string>com.qslicerpicker.app</string>
+          <key>CFBundleName</key>
+          <string>3D Slicer Picker</string>
+          <key>CFBundlePackageType</key>
+          <string>APPL</string>
+          <key>CFBundleVersion</key>
+          <string>1.0.0</string>
+          <key>CFBundleShortVersionString</key>
+          <string>1.0.0</string>
+          <key>CFBundleIconFile</key>
+          <string>icon</string>
+          <key>LSMinimumSystemVersion</key>
+          <string>10.13</string>
+        </dict>
+        </plist>
+        EOF
+        
+        # Code sign the .app bundle (ad-hoc signing for distribution)
+        codesign --force --deep --sign - "${APP_DIR}"
+        
+        # Verify code signing
+        codesign --verify --verbose "${APP_DIR}"
+        
+        # Remove quarantine attribute (helps with Gatekeeper on first run)
+        xattr -cr "${APP_DIR}" || true
+        
+        # Create zip for release (zip the .app bundle itself, not its contents)
+        # Use absolute path to avoid issues
+        ZIP_NAME="${{ matrix.asset }}.zip"
+        # Remove zip if exists
+        rm -f "${ZIP_NAME}"
+        # Create zip from the .app bundle directory
+        ditto -c -k --keepParent "${APP_DIR}" "${ZIP_NAME}" || zip -r "${ZIP_NAME}" "${APP_DIR}"
+
+    - name: Build (Linux)
+      if: matrix.os == 'linux'
+      shell: bash
+      env:
+        GOOS: ${{ matrix.os }}
+        GOARCH: ${{ matrix.arch }}
+        CGO_ENABLED: 1
+      run: |
+        go mod tidy
+        go build -v -o ${{ matrix.output }} .
+
+    - name: Build (Windows)
+      if: matrix.os == 'windows'
+      shell: bash
+      env:
+        GOOS: ${{ matrix.os }}
+        GOARCH: ${{ matrix.arch }}
+        CGO_ENABLED: 1
+      run: |
+        go mod tidy
+        go build -v -ldflags="-H windowsgui" -o ${{ matrix.output }} .
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.asset }}
+        path: |
+          ${{ matrix.asset }}.zip
+          ${{ matrix.output }}
+        if-no-files-found: ignore
+        retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        pattern: '*'
+        merge-multiple: false
+
+    - name: Prepare release files
+      run: |
+        # Debug: List all artifacts
+        echo "=== Artifacts structure ==="
+        find artifacts -type f -o -type d | head -20
+        echo ""
+        
+        # Create release directory
+        mkdir -p release
+        
+        # Copy macOS .app bundles (zipped)
+        find artifacts -name "qslicerpicker-macos-amd64.zip" -exec cp {} release/ \;
+        find artifacts -name "qslicerpicker-macos-arm64.zip" -exec cp {} release/ \;
+        
+        # Copy Linux binaries
+        find artifacts -name "qslicerpicker-linux-amd64" -type f -exec cp {} release/ \;
+        
+        # Copy Windows binaries
+        find artifacts -name "qslicerpicker-windows-amd64.exe" -exec cp {} release/ \;
+        
+        echo "=== Release files ==="
+        ls -lah release/
+
+    - name: Extract tag name
+      id: tag
+      run: |
+        TAG=${GITHUB_REF#refs/tags/}
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "Tag: $TAG"
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.tag.outputs.tag }}
+        name: Release ${{ steps.tag.outputs.tag }}
+        body: |
+          ## Release ${{ steps.tag.outputs.tag }}
+          
+          ### Downloads
+          
+          **macOS:**
+          - Intel (x86_64): Download `qslicerpicker-macos-amd64.zip` and extract the .app bundle
+          - Apple Silicon (ARM64): Download `qslicerpicker-macos-arm64.zip` and extract the .app bundle
+          
+          **Linux:**
+          - AMD64: `qslicerpicker-linux-amd64`
+          
+          **Windows:**
+          - AMD64: `qslicerpicker-windows-amd64.exe`
+          
+          ### Installation
+          
+          - **macOS**: 
+            - Extract the `.zip` file to get the `.app` bundle
+            - Move the `.app` bundle to your Applications folder
+            - On first launch, if macOS shows a security warning:
+              - Right-click the `.app` → Open (first time only), or
+              - Run: `sudo xattr -d com.apple.quarantine /path/to/QSlicerPicker-*.app`
+          - **Linux**: Make executable: `chmod +x qslicerpicker-linux-*` and run
+          - **Windows**: Run the `.exe` file
+        files: release/*
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
